@@ -19,3 +19,13 @@ CREATE TABLE rss_items (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(rss_url, item_guid)
 );
+
+-- RSS失败记录表 (用于跟踪访问失败的RSS源)
+CREATE TABLE rss_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rss_url TEXT NOT NULL UNIQUE,
+    error_message TEXT,
+    failure_count INTEGER DEFAULT 1,
+    last_failure DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
