@@ -44,6 +44,10 @@ export class TelegramBot {
         await this.handleDeleteCommand(userId, args);
         break;
       
+      case '/failed':
+        await this.handleFailedCommand(userId);
+        break;
+      
       case '/stats':
         await this.handleStatsCommand(userId);
         break;
@@ -56,6 +60,7 @@ export class TelegramBot {
           '📝 /list - 查看所有订阅\n' +
           '🗑 /del <编号> - 删除单个订阅\n' +
           '🗑 /del <编号1> <编号2> ... - 删除多个订阅\n' +
+          '⚠️ /failed - 查看失败的RSS订阅\n' +
           '📊 /stats - 查看统计信息\n' +
           '❓ /help - 显示帮助信息'
         );
@@ -105,6 +110,42 @@ export class TelegramBot {
     const message = summary + results.join('\n');
     
     await this.sendMessage(userId, message);
+  }
+
+  async handleFailedCommand(userId) {
+    try {
+      const userSubscriptions = await this.dbManager.getUserSubscriptions(userId);
+      const failedSubs = await this.dbManager.getFailedSubscriptions();
+      
+      // 过滤出用户的失败订阅
+      const userFailed = failedSubs.filter(failed => 
+        userSubscriptions.some(sub => sub.rss_url === failed.rss_url)
+      );
+      
+      if (userFailed.length === 0) {
+        await this.sendMessage(userId, '✅ 您的所有RSS订阅都工作正常！');
+        return;
+      }
+      
+      let message = `⚠️ 失败的RSS订阅 (${userFailed.length}个)：\n\n`;
+      
+      userFailed.forEach((failed, index) => {
+        const errorMsg = failed.error_message || '未知错误';
+        const shortError = errorMsg.length > 50 ? errorMsg.substring(0, 50) + '...' : errorMsg;
+        message += `${index + 1}. ${failed.site_name || '未知网站'}\n`;
+        message += `🔗 ${failed.rss_url}\n`;
+        message += `❌ ${shortError}\n`;
+        message += `🔄 失败次数: ${failed.failure_count}\n`;
+        message += `⏰ 最后失败: ${new Date(failed.last_failure).toLocaleString('zh-CN')}\n\n`;
+      });
+      
+      message += '💡 建议：检查RSS源是否可访问，或考虑删除失效的订阅';
+      
+      await this.sendMessage(userId, message);
+    } catch (error) {
+      console.error('获取失败订阅失败:', error);
+      await this.sendMessage(userId, '获取失败信息时出错，请稍后再试');
+    }
   }
 
   async handleStatsCommand(userId) {
