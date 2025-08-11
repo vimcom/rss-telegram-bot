@@ -17,11 +17,23 @@ export class DBManager {
     }
   }
 
-  async deleteSubscription(userId, rssUrl) {
+  async checkSubscriptionExists(userId, rssUrl) {
     const result = await this.db.prepare(
-      'DELETE FROM subscriptions WHERE user_id = ? AND rss_url = ?'
-    ).bind(userId, rssUrl).run();
-    return result.changes > 0;
+      'SELECT id FROM subscriptions WHERE user_id = ? AND rss_url = ?'
+    ).bind(userId, rssUrl).first();
+    return !!result;
+  }
+
+  async deleteSubscription(userId, rssUrl) {
+    try {
+      const result = await this.db.prepare(
+        'DELETE FROM subscriptions WHERE user_id = ? AND rss_url = ?'
+      ).bind(userId, rssUrl).run();
+      return result.changes > 0;
+    } catch (error) {
+      console.error('删除订阅时发生错误:', error);
+      return false;
+    }
   }
 
   async getUserSubscriptions(userId) {
