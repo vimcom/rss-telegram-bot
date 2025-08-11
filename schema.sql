@@ -29,3 +29,36 @@ CREATE TABLE rss_failures (
     last_failure DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 推送目标：记录被添加的群组/超级群组/频道
+CREATE TABLE IF NOT EXISTS push_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    chat_type TEXT NOT NULL, -- group | supergroup | channel
+    title TEXT,
+    username TEXT,
+    status TEXT DEFAULT 'active', -- active | inactive
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(owner_user_id, chat_id)
+);
+
+-- 订阅与推送目标的绑定关系（一个订阅可以绑定多个目标）
+CREATE TABLE IF NOT EXISTS subscription_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id TEXT NOT NULL,
+    rss_url TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(owner_user_id, rss_url, chat_id)
+);
+
+-- 推送记录：用于防止同一条文章对同一目标重复推送
+CREATE TABLE IF NOT EXISTS push_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rss_url TEXT NOT NULL,
+    item_guid TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(rss_url, item_guid, chat_id)
+);
