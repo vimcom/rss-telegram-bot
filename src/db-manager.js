@@ -3,6 +3,42 @@ export class DBManager {
     this.db = db;
   }
 
+  async ensureSchema() {
+    // Create new tables if they do not exist (idempotent)
+    const stmts = [
+      `CREATE TABLE IF NOT EXISTS push_targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        chat_type TEXT NOT NULL,
+        title TEXT,
+        username TEXT,
+        status TEXT DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(owner_user_id, chat_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS subscription_targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id TEXT NOT NULL,
+        rss_url TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(owner_user_id, rss_url, chat_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS push_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rss_url TEXT NOT NULL,
+        item_guid TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(rss_url, item_guid, chat_id)
+      )`
+    ];
+    for (const sql of stmts) {
+      await this.db.prepare(sql).run();
+    }
+  }
+
   async addSubscription(userId, rssUrl, siteName) {
     try {
       await this.db.prepare(
@@ -14,6 +50,110 @@ export class DBManager {
         return false; // 已存在
       }
       throw error;
+    }
+  }
+
+  // ========== Push Targets ==========
+  async upsertPushTarget({ ownerUserId, chatId, chatType, title, username }) {
+    // Insert or update basic info; keep status as is if existing
+    const existing = await this.db.prepare(
+      'SELECT id, status FROM push_targets WHERE owner_user_id = ? AND chat_id = ?'
+    ).bind(ownerUserId, chatId).first();
+
+    if (existing) {
+      await this.db.prepare(
+        'UPDATE push_targets SET chat_type = ?, title = ?, username = ? WHERE owner_user_id = ? AND chat_id = ?'
+      ).bind(chatType, title || null, username || null, ownerUserId, chatId).run();
+      return { id: existing.id, status: existing.status };
+    }
+
+    const result = await this.db.prepare(
+      'INSERT INTO push_targets (owner_user_id, chat_id, chat_type, title, username, status) VALUES (?, ?, ?, ?, ?, ? )'
+    ).bind(ownerUserId, chatId, chatType, title || null, username || null, 'active').run();
+    return { id: result.lastRowId, status: 'active' };
+  }
+
+  async listPushTargets(ownerUserId) {
+    const result = await this.db.prepare(
+      'SELECT id, owner_user_id, chat_id, chat_type, title, username, status, created_at FROM push_targets WHERE owner_user_id = ? ORDER BY created_at DESC'
+    ).bind(ownerUserId).all();
+    return result.results || [];
+  }
+
+  async setPushTargetStatus(ownerUserId, chatId, status) {
+    const result = await this.db.prepare(
+      'UPDATE push_targets SET status = ? WHERE owner_user_id = ? AND chat_id = ?'
+    ).bind(status, ownerUserId, chatId).run();
+    return result.changes > 0;
+  }
+
+  async deletePushTarget(ownerUserId, chatId) {
+    // Also cascade delete bindings for this owner+chat
+    await this.db.prepare('DELETE FROM subscription_targets WHERE owner_user_id = ? AND chat_id = ?')
+      .bind(ownerUserId, chatId).run();
+    const result = await this.db.prepare('DELETE FROM push_targets WHERE owner_user_id = ? AND chat_id = ?')
+      .bind(ownerUserId, chatId).run();
+    return result.changes > 0;
+  }
+
+  // ========== Subscription Bindings ==========
+  async listBindings(ownerUserId) {
+    const result = await this.db.prepare(
+      'SELECT owner_user_id, rss_url, chat_id, created_at FROM subscription_targets WHERE owner_user_id = ? ORDER BY created_at DESC'
+    ).bind(ownerUserId).all();
+    return result.results || [];
+  }
+
+  async listBindingsForSubscription(ownerUserId, rssUrl) {
+    const result = await this.db.prepare(
+      `SELECT st.chat_id
+       FROM subscription_targets st
+       LEFT JOIN push_targets pt ON pt.owner_user_id = st.owner_user_id AND pt.chat_id = st.chat_id
+       WHERE st.owner_user_id = ? AND st.rss_url = ? AND (pt.status = 'active' OR pt.status IS NULL)`
+    ).bind(ownerUserId, rssUrl).all();
+    return (result.results || []).map(r => r.chat_id);
+  }
+
+  async bindSubscriptionTargets(ownerUserId, rssUrl, chatIds) {
+    let added = 0;
+    for (const chatId of chatIds) {
+      try {
+        await this.db.prepare(
+          'INSERT INTO subscription_targets (owner_user_id, rss_url, chat_id) VALUES (?, ?, ?)'
+        ).bind(ownerUserId, rssUrl, chatId).run();
+        added++;
+      } catch (e) {
+        // ignore unique constraint
+        if (!e.message.includes('UNIQUE')) throw e;
+      }
+    }
+    return added;
+  }
+
+  async unbindSubscription(ownerUserId, rssUrl) {
+    const result = await this.db.prepare(
+      'DELETE FROM subscription_targets WHERE owner_user_id = ? AND rss_url = ?'
+    ).bind(ownerUserId, rssUrl).run();
+    return result.changes;
+  }
+
+  // ========== Push Records for de-duplication ==========
+  async hasPushedToChat(rssUrl, itemGuid, chatId) {
+    const result = await this.db.prepare(
+      'SELECT id FROM push_records WHERE rss_url = ? AND item_guid = ? AND chat_id = ?'
+    ).bind(rssUrl, itemGuid, chatId).first();
+    return !!result;
+  }
+
+  async savePushRecord(rssUrl, itemGuid, chatId) {
+    try {
+      await this.db.prepare(
+        'INSERT INTO push_records (rss_url, item_guid, chat_id) VALUES (?, ?, ?)'
+      ).bind(rssUrl, itemGuid, chatId).run();
+      return true;
+    } catch (e) {
+      if (e.message.includes('UNIQUE')) return false;
+      throw e;
     }
   }
 
@@ -87,8 +227,15 @@ export class DBManager {
 
   async getAllSubscriptions() {
     const result = await this.db.prepare(
-      'SELECT DISTINCT user_id, rss_url, site_name FROM subscriptions'
+      'SELECT id, user_id, rss_url, site_name, created_at FROM subscriptions'
     ).all();
+    return result.results || [];
+  }
+
+  async getSubscribersByRssUrl(rssUrl) {
+    const result = await this.db.prepare(
+      'SELECT user_id, site_name FROM subscriptions WHERE rss_url = ?'
+    ).bind(rssUrl).all();
     return result.results || [];
   }
 
