@@ -76,8 +76,35 @@ export class DBManager {
   }
 
   async cleanupOldItems(days = 30) {
-    await this.db.prepare(
-      'DELETE FROM rss_items WHERE created_at < datetime("now", "-" || ? || " days")'
-    ).bind(days).run();
+    try {
+      // 删除旧的RSS文章记录
+      const result = await this.db.prepare(
+        'DELETE FROM rss_items WHERE created_at < datetime("now", "-" || ? || " days")'
+      ).bind(days).run();
+      
+      console.log(`清理了 ${result.changes} 条旧记录`);
+      return result.changes;
+    } catch (error) {
+      console.error('清理旧记录失败:', error);
+      return 0;
+    }
+  }
+
+  // 获取统计信息
+  async getStats() {
+    try {
+      const subCount = await this.db.prepare('SELECT COUNT(*) as count FROM subscriptions').first();
+      const itemCount = await this.db.prepare('SELECT COUNT(*) as count FROM rss_items').first();
+      const userCount = await this.db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM subscriptions').first();
+      
+      return {
+        subscriptions: subCount?.count || 0,
+        items: itemCount?.count || 0,
+        users: userCount?.count || 0
+      };
+    } catch (error) {
+      console.error('获取统计信息失败:', error);
+      return { subscriptions: 0, items: 0, users: 0 };
+    }
   }
 }
