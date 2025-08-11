@@ -44,6 +44,10 @@ export class TelegramBot {
         await this.handleDeleteCommand(userId, args);
         break;
       
+      case '/proxy':
+        await this.handleProxyCommand(userId, args);
+        break;
+      
       case '/failed':
         await this.handleFailedCommand(userId);
         break;
@@ -60,6 +64,7 @@ export class TelegramBot {
           '📝 /list - 查看所有订阅\n' +
           '🗑 /del <编号> - 删除单个订阅\n' +
           '🗑 /del <编号1> <编号2> ... - 删除多个订阅\n' +
+          '🔧 /proxy <RSS链接> - 测试RSS源访问情况\n' +
           '⚠️ /failed - 查看失败的RSS订阅\n' +
           '📊 /stats - 查看统计信息\n' +
           '❓ /help - 显示帮助信息'
@@ -90,11 +95,19 @@ export class TelegramBot {
           continue;
         }
 
-        const siteName = await this.extractSiteName(url);
+        // 先测试RSS源是否可访问
+        const testResult = await this.testRSSSource(url);
+        if (!testResult.accessible) {
+          results.push(`⚠️ 无法访问：${url}\n   错误：${testResult.error}`);
+          errorCount++;
+          continue;
+        }
+
+        const siteName = testResult.siteName || await this.extractSiteName(url);
         const added = await this.dbManager.addSubscription(userId, url, siteName);
         
         if (added) {
-          results.push(`✅ 已添加：${siteName}`);
+          results.push(`✅ 已添加：${siteName}${testResult.proxyUsed ? ' (通过代理)' : ''}`);
           addedCount++;
         } else {
           results.push(`⚠️ 已订阅：${siteName}`);
@@ -110,6 +123,118 @@ export class TelegramBot {
     const message = summary + results.join('\n');
     
     await this.sendMessage(userId, message);
+  }
+
+  // 测试RSS源可访问性
+  async testRSSSource(url) {
+    const rssParser = new (await import('./rss-parser.js')).RSSParser();
+    
+    try {
+      // 尝试获取第一条内容以验证
+      const items = await rssParser.parseRSS(url);
+      
+      if (items.length > 0) {
+        return { 
+          accessible: true, 
+          siteName: await this.extractSiteName(url),
+          proxyUsed: false // 这里简化处理，实际可以从parser返回更多信息
+        };
+      } else {
+        return { 
+          accessible: false, 
+          error: 'RSS源无内容或格式错误' 
+        };
+      }
+    } catch (error) {
+      return { 
+        accessible: false, 
+        error: error.message 
+      };
+    }
+  }
+
+  async handleProxyCommand(userId, args) {
+    if (args.length === 0) {
+      await this.sendMessage(userId, 
+        '🔧 代理测试命令：\n\n' +
+        '📝 用法：/proxy <RSS链接>\n' +
+        '🎯 功能：测试RSS源访问情况\n' +
+        '📊 显示：直连状态、代理结果、内容预览\n\n' +
+        '💡 示例：/proxy https://linux.do/latest.rss'
+      );
+      return;
+    }
+
+    const url = args[0];
+    if (!this.isValidUrl(url)) {
+      await this.sendMessage(userId, '❌ 无效的URL格式');
+      return;
+    }
+
+    await this.sendMessage(userId, '🔍 正在测试RSS源访问情况，请稍候...');
+
+    const rssParser = new (await import('./rss-parser.js')).RSSParser();
+    
+    try {
+      // 测试直接访问
+      let directResult = '❌ 直接访问失败';
+      let proxyResult = '❌ 代理访问失败';
+      let contentPreview = '';
+
+      try {
+        const directResponse = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/xml, text/xml'
+          },
+          timeout: 10000
+        });
+        
+        if (directResponse.ok) {
+          directResult = '✅ 直接访问成功';
+          const xmlText = await directResponse.text();
+          const items = rssParser.parseXML(xmlText);
+          if (items.length > 0) {
+            contentPreview = `📄 内容预览：${items[0].title}`;
+          }
+        } else {
+          directResult = `❌ 直接访问失败 (HTTP ${directResponse.status})`;
+        }
+      } catch (error) {
+        directResult = `❌ 直接访问失败 (${error.message})`;
+      }
+
+      // 测试代理访问
+      if (!directResult.includes('成功')) {
+        try {
+          const items = await rssParser.parseRSS(url);
+          if (items.length > 0) {
+            proxyResult = '✅ 代理访问成功';
+            contentPreview = `📄 内容预览：${items[0].title}`;
+          }
+        } catch (error) {
+          proxyResult = `❌ 代理访问失败 (${error.message})`;
+        }
+      }
+
+      const siteName = await this.extractSiteName(url);
+      
+      const message = 
+        `🔍 RSS源测试结果：\n\n` +
+        `🌐 网站：${siteName}\n` +
+        `🔗 链接：${url}\n\n` +
+        `📡 ${directResult}\n` +
+        `🔀 ${proxyResult}\n\n` +
+        `${contentPreview}\n\n` +
+        `💡 ${directResult.includes('成功') || proxyResult.includes('成功') ? 
+          '该RSS源可以正常使用' : 
+          '该RSS源暂时无法访问，建议检查链接或稍后再试'
+        }`;
+      
+      await this.sendMessage(userId, message);
+    } catch (error) {
+      await this.sendMessage(userId, `❌ 测试过程中发生错误：${error.message}`);
+    }
   }
 
   async handleFailedCommand(userId) {
