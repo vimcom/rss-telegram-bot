@@ -6,6 +6,14 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     
+    // Ensure new schema tables exist
+    try {
+      const dbManager = new DBManager(env.DB);
+      await dbManager.ensureSchema();
+    } catch (e) {
+      console.warn('初始化数据库结构失败(可忽略):', e.message);
+    }
+
     // Telegram Webhook处理
     if (url.pathname === '/webhook' && request.method === 'POST') {
       const bot = new TelegramBot(env.TELEGRAM_BOT_TOKEN, env.DB);
@@ -37,47 +45,48 @@ export default {
       // 获取所有订阅
       const subscriptions = await dbManager.getAllSubscriptions();
       
-      // 分批处理，避免超时
-      const BATCH_SIZE = 50;
-      const batches = [];
-      for (let i = 0; i < subscriptions.length; i += BATCH_SIZE) {
-        batches.push(subscriptions.slice(i, i + BATCH_SIZE));
+      // 将订阅按 rss_url 分组，避免重复抓取
+      const urlToSubscribers = new Map();
+      for (const sub of subscriptions) {
+        const key = sub.rss_url;
+        if (!urlToSubscribers.has(key)) urlToSubscribers.set(key, []);
+        urlToSubscribers.get(key).push(sub);
       }
-      
-      for (const batch of batches) {
-        await Promise.all(batch.map(async (sub) => {
+
+      // 分批处理 URLs，避免超时
+      const urls = Array.from(urlToSubscribers.keys());
+      const BATCH_SIZE = 30;
+      for (let i = 0; i < urls.length; i += BATCH_SIZE) {
+        const batchUrls = urls.slice(i, i + BATCH_SIZE);
+        await Promise.all(batchUrls.map(async (rssUrl) => {
+          const subsForUrl = urlToSubscribers.get(rssUrl);
+          const siteName = subsForUrl[0]?.site_name || 'RSS';
           try {
-            const items = await rssParser.parseRSS(sub.rss_url);
-            
+            const items = await rssParser.parseRSS(rssUrl);
             if (items.length > 0) {
-              // 成功获取内容，清除失败记录
-              await dbManager.clearFailureRecord(sub.rss_url);
-              
+              await dbManager.clearFailureRecord(rssUrl);
               for (const item of items) {
-                // 检查是否已推送过
-                const exists = await dbManager.checkItemExists(sub.rss_url, item.guid);
-                
-                if (!exists) {
-                  // 推送到Telegram
-                  await bot.sendRSSItem(sub.user_id, item, sub.site_name);
-                  
-                  // 记录已推送
-                  await dbManager.saveRSSItem(sub.rss_url, item);
-                  
-                  // 延迟避免频率限制
-                  await new Promise(resolve => setTimeout(resolve, 500));
+                const exists = await dbManager.checkItemExists(rssUrl, item.guid);
+                if (exists) continue;
+
+                // 推送给所有订阅该URL的用户（每人私聊 + 各自绑定的目标）
+                for (const sub of subsForUrl) {
+                  await bot.sendRSSUpdate(sub.user_id, rssUrl, item, siteName);
+                  // 100ms between users to be gentle
+                  await new Promise(resolve => setTimeout(resolve, 100));
                 }
+                await dbManager.saveRSSItem(rssUrl, item);
+                // 每条item之间 200ms
+                await new Promise(resolve => setTimeout(resolve, 200));
               }
             }
           } catch (error) {
-            console.error(`处理RSS源 ${sub.rss_url} 失败:`, error);
-            // 记录失败信息
-            await dbManager.recordFailure(sub.rss_url, error.message);
+            console.error(`处理RSS源 ${rssUrl} 失败:`, error);
+            await dbManager.recordFailure(rssUrl, error.message);
           }
         }));
-        
         // 批次间延迟
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, 1500));
       }
       
       // 清理30天前的旧记录
