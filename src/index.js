@@ -27,7 +27,7 @@ export default {
     ctx.waitUntil(this.checkRSSFeeds(env));
   },
 
-  // 检查所有RSS源
+  // 检查所有RSS源（优化版本）
   async checkRSSFeeds(env) {
     const dbManager = new DBManager(env.DB);
     const rssParser = new RSSParser();
@@ -37,29 +37,45 @@ export default {
       // 获取所有订阅
       const subscriptions = await dbManager.getAllSubscriptions();
       
-      for (const sub of subscriptions) {
-        try {
-          const items = await rssParser.parseRSS(sub.rss_url);
-          
-          for (const item of items) {
-            // 检查是否已推送过
-            const exists = await dbManager.checkItemExists(sub.rss_url, item.guid);
-            
-            if (!exists) {
-              // 推送到Telegram
-              await bot.sendRSSItem(sub.user_id, item, sub.site_name);
-              
-              // 记录已推送
-              await dbManager.saveRSSItem(sub.rss_url, item);
-              
-              // 延迟避免频率限制
-              await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-          }
-        } catch (error) {
-          console.error(`处理RSS源 ${sub.rss_url} 失败:`, error);
-        }
+      // 分批处理，避免超时
+      const BATCH_SIZE = 50;
+      const batches = [];
+      for (let i = 0; i < subscriptions.length; i += BATCH_SIZE) {
+        batches.push(subscriptions.slice(i, i + BATCH_SIZE));
       }
+      
+      for (const batch of batches) {
+        await Promise.all(batch.map(async (sub) => {
+          try {
+            const items = await rssParser.parseRSS(sub.rss_url);
+            
+            for (const item of items) {
+              // 检查是否已推送过
+              const exists = await dbManager.checkItemExists(sub.rss_url, item.guid);
+              
+              if (!exists) {
+                // 推送到Telegram
+                await bot.sendRSSItem(sub.user_id, item, sub.site_name);
+                
+                // 记录已推送
+                await dbManager.saveRSSItem(sub.rss_url, item);
+                
+                // 延迟避免频率限制
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
+            }
+          } catch (error) {
+            console.error(`处理RSS源 ${sub.rss_url} 失败:`, error);
+          }
+        }));
+        
+        // 批次间延迟
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      
+      // 清理30天前的旧记录
+      await dbManager.cleanupOldItems(30);
+      
     } catch (error) {
       console.error('RSS检查失败:', error);
     }
