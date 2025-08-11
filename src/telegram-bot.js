@@ -44,6 +44,10 @@ export class TelegramBot {
         await this.handleDeleteCommand(userId, args);
         break;
       
+      case '/stats':
+        await this.handleStatsCommand(userId);
+        break;
+      
       case '/help':
         await this.sendMessage(userId, 
           '📖 帮助信息：\n\n' +
@@ -52,6 +56,7 @@ export class TelegramBot {
           '📝 /list - 查看所有订阅\n' +
           '🗑 /del <编号> - 删除单个订阅\n' +
           '🗑 /del <编号1> <编号2> ... - 删除多个订阅\n' +
+          '📊 /stats - 查看统计信息\n' +
           '❓ /help - 显示帮助信息'
         );
         break;
@@ -100,6 +105,28 @@ export class TelegramBot {
     const message = summary + results.join('\n');
     
     await this.sendMessage(userId, message);
+  }
+
+  async handleStatsCommand(userId) {
+    try {
+      const userStats = await this.dbManager.getUserSubscriptions(userId);
+      const globalStats = await this.dbManager.getStats();
+      
+      const message = 
+        `📊 统计信息：\n\n` +
+        `👤 您的订阅：${userStats.length} 个\n` +
+        `🌐 全局统计：\n` +
+        `  └ 总用户：${globalStats.users} 人\n` +
+        `  └ 总订阅：${globalStats.subscriptions} 个\n` +
+        `  └ 文章记录：${globalStats.items} 条\n\n` +
+        `🔄 检查频率：每10分钟\n` +
+        `💾 记录保留：30天`;
+      
+      await this.sendMessage(userId, message);
+    } catch (error) {
+      console.error('获取统计信息失败:', error);
+      await this.sendMessage(userId, '获取统计信息失败，请稍后再试');
+    }
   }
 
   async handleListCommand(userId) {
