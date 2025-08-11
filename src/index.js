@@ -49,23 +49,30 @@ export default {
           try {
             const items = await rssParser.parseRSS(sub.rss_url);
             
-            for (const item of items) {
-              // 检查是否已推送过
-              const exists = await dbManager.checkItemExists(sub.rss_url, item.guid);
+            if (items.length > 0) {
+              // 成功获取内容，清除失败记录
+              await dbManager.clearFailureRecord(sub.rss_url);
               
-              if (!exists) {
-                // 推送到Telegram
-                await bot.sendRSSItem(sub.user_id, item, sub.site_name);
+              for (const item of items) {
+                // 检查是否已推送过
+                const exists = await dbManager.checkItemExists(sub.rss_url, item.guid);
                 
-                // 记录已推送
-                await dbManager.saveRSSItem(sub.rss_url, item);
-                
-                // 延迟避免频率限制
-                await new Promise(resolve => setTimeout(resolve, 500));
+                if (!exists) {
+                  // 推送到Telegram
+                  await bot.sendRSSItem(sub.user_id, item, sub.site_name);
+                  
+                  // 记录已推送
+                  await dbManager.saveRSSItem(sub.rss_url, item);
+                  
+                  // 延迟避免频率限制
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                }
               }
             }
           } catch (error) {
             console.error(`处理RSS源 ${sub.rss_url} 失败:`, error);
+            // 记录失败信息
+            await dbManager.recordFailure(sub.rss_url, error.message);
           }
         }));
         
