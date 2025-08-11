@@ -134,7 +134,9 @@ export class TelegramBot {
     let deletedCount = 0;
     let errorCount = 0;
     const results = [];
+    const toDelete = []; // 先收集要删除的项目
 
+    // 验证所有编号并收集要删除的订阅
     for (const arg of args) {
       const index = parseInt(arg) - 1;
       
@@ -145,12 +147,32 @@ export class TelegramBot {
       }
 
       const subscription = subscriptions[index];
-      const deleted = await this.dbManager.deleteSubscription(userId, subscription.rss_url);
-      
-      if (deleted) {
-        results.push(`✅ 已删除：${subscription.site_name}`);
-        deletedCount++;
-      } else {
+      if (!toDelete.find(item => item.rss_url === subscription.rss_url)) {
+        toDelete.push(subscription);
+      }
+    }
+
+    // 执行删除操作
+    for (const subscription of toDelete) {
+      try {
+        const deleted = await this.dbManager.deleteSubscription(userId, subscription.rss_url);
+        
+        if (deleted) {
+          results.push(`✅ 已删除：${subscription.site_name}`);
+          deletedCount++;
+        } else {
+          // 检查是否真的存在于数据库中
+          const stillExists = await this.dbManager.checkSubscriptionExists(userId, subscription.rss_url);
+          if (!stillExists) {
+            results.push(`✅ 已删除：${subscription.site_name}`);
+            deletedCount++;
+          } else {
+            results.push(`❌ 删除失败：${subscription.site_name}`);
+            errorCount++;
+          }
+        }
+      } catch (error) {
+        console.error('删除订阅失败:', error);
         results.push(`❌ 删除失败：${subscription.site_name}`);
         errorCount++;
       }
