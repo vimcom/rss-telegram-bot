@@ -11,6 +11,8 @@ export class TelegramBot {
     try {
       if (update.message) {
         await this.handleMessage(update.message);
+      } else if (update.my_chat_member) {
+        await this.handleMyChatMember(update.my_chat_member);
       }
       return new Response('OK', { status: 200 });
     } catch (error) {
@@ -21,6 +23,7 @@ export class TelegramBot {
 
   async handleMessage(message) {
     const userId = message.from.id.toString();
+    const chatType = message.chat?.type || 'private';
     const text = message.text?.trim();
 
     if (!text || !text.startsWith('/')) return;
@@ -29,7 +32,7 @@ export class TelegramBot {
 
     switch (command) {
       case '/start':
-        await this.sendMessage(userId, '欢迎使用RSS订阅Bot！\n\n可用命令：\n/add <RSS链接> - 添加订阅\n/list - 查看订阅列表\n/del <编号> - 删除订阅\n/help - 帮助信息');
+        await this.sendMessage(userId, '欢迎使用RSS订阅Bot！\n\n可用命令：\n/add <RSS链接> - 添加订阅\n/list - 查看订阅列表\n/del <编号> - 删除订阅\n/channels - 查看可用推送目标\n/targets - 管理推送目标\n/bind <订阅号> <目标号或列表> - 绑定推送\n/unbind <订阅号> - 解除绑定\n/help - 帮助信息');
         break;
       
       case '/add':
@@ -56,6 +59,38 @@ export class TelegramBot {
         await this.handleStatsCommand(userId);
         break;
       
+      case '/channels':
+        if (chatType !== 'private') {
+          await this.sendMessage(message.chat.id.toString(), '请在与Bot的私聊中使用该命令');
+          break;
+        }
+        await this.handleChannelsCommand(userId);
+        break;
+
+      case '/targets':
+        if (chatType !== 'private') {
+          await this.sendMessage(message.chat.id.toString(), '请在与Bot的私聊中使用该命令');
+          break;
+        }
+        await this.handleTargetsCommand(userId, args);
+        break;
+
+      case '/bind':
+        if (chatType !== 'private') {
+          await this.sendMessage(message.chat.id.toString(), '请在与Bot的私聊中使用该命令');
+          break;
+        }
+        await this.handleBindCommand(userId, args);
+        break;
+
+      case '/unbind':
+        if (chatType !== 'private') {
+          await this.sendMessage(message.chat.id.toString(), '请在与Bot的私聊中使用该命令');
+          break;
+        }
+        await this.handleUnbindCommand(userId, args);
+        break;
+
       case '/help':
         await this.sendMessage(userId, 
           '📖 帮助信息：\n\n' +
@@ -64,6 +99,10 @@ export class TelegramBot {
           '📝 /list - 查看所有订阅\n' +
           '🗑 /del <编号> - 删除单个订阅\n' +
           '🗑 /del <编号1> <编号2> ... - 删除多个订阅\n' +
+          '📢 /channels - 查看可推送的频道/群组\n' +
+          '🎯 /targets - 管理推送目标（激活/停用/删除）\n' +
+          '🔗 /bind <订阅号> <目标号,目标号> - 绑定订阅\n' +
+          '❌ /unbind <订阅号> - 解除绑定\n' +
           '🔧 /proxy <RSS链接> - 测试RSS源访问情况\n' +
           '⚠️ /failed - 查看失败的RSS订阅\n' +
           '📊 /stats - 查看统计信息\n' +
@@ -73,6 +112,47 @@ export class TelegramBot {
       
       default:
         await this.sendMessage(userId, '未知命令，输入 /help 查看帮助');
+    }
+  }
+
+  async handleMyChatMember(myChatMember) {
+    try {
+      const actorUserId = myChatMember.from?.id?.toString();
+      const chat = myChatMember.chat;
+      const newStatus = myChatMember.new_chat_member?.status;
+
+      if (!actorUserId || !chat || !newStatus) return;
+
+      const chatType = chat.type; // 'group' | 'supergroup' | 'channel' | 'private'
+      if (!['group', 'supergroup', 'channel'].includes(chatType)) return;
+
+      // Register on join or promotion to administrator/member
+      if (['administrator', 'member', 'creator'].includes(newStatus)) {
+        const chatId = chat.id.toString();
+        const title = chat.title || '';
+        const username = chat.username || '';
+        await this.dbManager.upsertPushTarget({
+          ownerUserId: actorUserId,
+          chatId,
+          chatType,
+          title,
+          username
+        });
+
+        // Try to send a confirmation message to the target chat
+        const typeLabel = chatType === 'channel' ? '频道' : (chatType === 'supergroup' ? '超级群组' : '群组');
+        const confirm = `✅ 已注册推送目标：${title || username || chatId}\n📋 类型：${typeLabel}\n🆔 ID：${chatId}\n\n现在可在私聊使用 /channels 查看并 /bind 绑定订阅。`;
+        try {
+          await this.sendMessage(chatId, confirm);
+        } catch (_) {
+          // ignore errors (e.g., no permission in channel)
+        }
+
+        // Notify the owner in private chat
+        await this.sendMessage(actorUserId, `📢 收到新推送目标\n${confirm}`);
+      }
+    } catch (e) {
+      console.error('处理my_chat_member失败:', e);
     }
   }
 
@@ -304,11 +384,15 @@ export class TelegramBot {
     }
 
     let message = `📚 您的订阅列表（${subscriptions.length}个）：\n\n`;
-    subscriptions.forEach((sub, index) => {
-      message += `${index + 1}. ${sub.site_name}\n🔗 ${sub.rss_url}\n\n`;
-    });
+    // For each subscription, show binding count
+    for (let i = 0; i < subscriptions.length; i++) {
+      const sub = subscriptions[i];
+      const boundChats = await this.dbManager.listBindingsForSubscription(userId, sub.rss_url);
+      message += `${i + 1}. ${sub.site_name}\n🔗 ${sub.rss_url}\n`;
+      message += `📌 绑定：${boundChats.length} 个目标\n\n`;
+    }
     
-    message += '💡 使用 /del <编号> 删除订阅';
+    message += '💡 使用 /del <编号> 删除订阅\n💡 使用 /bind <订阅号> <目标号,目标号> 进行绑定';
     await this.sendMessage(userId, message);
   }
 
@@ -393,6 +477,27 @@ export class TelegramBot {
     await this.sendMessage(userId, message, true);
   }
 
+   // 发送RSS到私聊 + 绑定目标，带防重复和频率控制
+  async sendRSSUpdate(ownerUserId, rssUrl, item, siteName) {
+    // Always send to private chat (owner)
+    await this.sendRSSItem(ownerUserId, item, siteName);
+
+    // Send to bound targets (active only)
+    const chatIds = await this.dbManager.listBindingsForSubscription(ownerUserId, rssUrl);
+    for (const chatId of chatIds) {
+      try {
+        const already = await this.dbManager.hasPushedToChat(rssUrl, item.guid, chatId);
+        if (already) continue;
+        await this.sendRSSItem(chatId, item, siteName);
+        await this.dbManager.savePushRecord(rssUrl, item.guid, chatId);
+        // 100ms delay
+        await new Promise(r => setTimeout(r, 100));
+      } catch (e) {
+        console.warn('推送到目标失败', chatId, e.message);
+      }
+    }
+  }
+
   async sendMessage(userId, text, parseMode = false) {
     const payload = {
       chat_id: userId,
@@ -440,3 +545,147 @@ export class TelegramBot {
     return text.replace(/[_*\[\]()~`>#+=|{}.!-]/g, '\\$&');
   }
 }
+
+// ===== Targets & Binding Commands =====
+TelegramBot.prototype.handleChannelsCommand = async function (userId) {
+  const targets = await this.dbManager.listPushTargets(userId);
+  if (targets.length === 0) {
+    await this.sendMessage(userId, '尚未注册任何推送目标。\n将Bot添加到群组/频道后会自动注册。');
+    return;
+  }
+
+  let msg = `📢 推送目标列表 (${targets.length}个)：\n\n`;
+  targets.forEach((t, idx) => {
+    const typeLabel = t.chat_type === 'channel' ? '频道' : (t.chat_type === 'supergroup' ? '超级群组' : '群组');
+    const name = t.title || (t.username ? `@${t.username}` : t.chat_id);
+    const statusEmoji = t.status === 'active' ? '🟢' : '🔴';
+    msg += `${idx + 1}. ${statusEmoji} ${name}\n📋 类型：${typeLabel}\n🆔 ID：${t.chat_id}\n\n`;
+  });
+  msg += '💡 可使用 /bind <订阅号> <目标号,目标号> 进行绑定';
+  await this.sendMessage(userId, msg);
+};
+
+TelegramBot.prototype.handleTargetsCommand = async function (userId, args) {
+  const targets = await this.dbManager.listPushTargets(userId);
+  if (targets.length === 0) {
+    await this.sendMessage(userId, '没有可管理的推送目标');
+    return;
+  }
+
+  if (args.length === 0) {
+    let msg = '🎯 推送目标管理：\n\n';
+    targets.forEach((t, idx) => {
+      const name = t.title || (t.username ? `@${t.username}` : t.chat_id);
+      const statusEmoji = t.status === 'active' ? '🟢 active' : '🔴 inactive';
+      msg += `${idx + 1}. ${name} (${statusEmoji})\n`;
+    });
+    msg += '\n指令：\n/targets activate <编号>\n/targets deactivate <编号>\n/targets delete <编号>';
+    await this.sendMessage(userId, msg);
+    return;
+  }
+
+  const action = args[0];
+  const indexStr = args[1];
+  const idx = parseInt(indexStr, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= targets.length) {
+    await this.sendMessage(userId, '无效编号');
+    return;
+  }
+  const target = targets[idx];
+  if (action === 'activate' || action === 'deactivate') {
+    const status = action === 'activate' ? 'active' : 'inactive';
+    const ok = await this.dbManager.setPushTargetStatus(userId, target.chat_id, status);
+    await this.sendMessage(userId, ok ? '已更新状态' : '更新失败');
+  } else if (action === 'delete') {
+    const ok = await this.dbManager.deletePushTarget(userId, target.chat_id);
+    // 兼容已实际删除但返回变更计数不可靠的情况，复查列表
+    const refreshed = await this.dbManager.listPushTargets(userId);
+    const stillExists = refreshed.some(t => t.chat_id === target.chat_id);
+    const success = ok || !stillExists;
+    await this.sendMessage(userId, success ? '已删除目标及相关绑定' : '删除失败');
+  } else {
+    await this.sendMessage(userId, '未知操作，仅支持 activate/deactivate/delete');
+  }
+};
+
+TelegramBot.prototype.handleBindCommand = async function (userId, args) {
+  if (args.length < 2) {
+    await this.sendMessage(userId, '用法：/bind <订阅号或范围> <目标号,目标号>\n示例：/bind 1,2,3 2  或  /bind 1-3 2');
+    return;
+  }
+
+  const subs = await this.dbManager.getUserSubscriptions(userId);
+  const targets = await this.dbManager.listPushTargets(userId);
+  if (subs.length === 0 || targets.length === 0) {
+    await this.sendMessage(userId, '请先添加订阅并将Bot加入群组/频道');
+    return;
+  }
+
+  // Parse subscriptions: support single index, comma list, or range like 1-3
+  const subToken = args[0];
+  const subIndices = new Set();
+  subToken.split(/[，,]+/).forEach(part => {
+    if (!part) return;
+    if (/^\d+-\d+$/.test(part)) {
+      const [a, b] = part.split('-').map(n => parseInt(n, 10));
+      if (!isNaN(a) && !isNaN(b)) {
+        const start = Math.min(a, b);
+        const end = Math.max(a, b);
+        for (let i = start; i <= end; i++) subIndices.add(i - 1);
+      }
+    } else {
+      const idx = parseInt(part, 10) - 1;
+      if (!isNaN(idx)) subIndices.add(idx);
+    }
+  });
+
+  const validSubIndices = Array.from(subIndices).filter(i => i >= 0 && i < subs.length);
+  if (validSubIndices.length === 0) {
+    await this.sendMessage(userId, '没有有效的订阅编号');
+    return;
+  }
+
+  // Parse target indices (one or many)
+  const targetArg = args.slice(1).join(' ');
+  const tokens = targetArg.split(/[，,\s]+/).filter(Boolean);
+  const chatIds = [];
+  const targetNames = [];
+  for (const tok of tokens) {
+    const idx = parseInt(tok, 10) - 1;
+    if (!isNaN(idx) && idx >= 0 && idx < targets.length) {
+      chatIds.push(targets[idx].chat_id);
+      targetNames.push(targets[idx].title || targets[idx].username || targets[idx].chat_id);
+    }
+  }
+  if (chatIds.length === 0) {
+    await this.sendMessage(userId, '没有有效的目标编号');
+    return;
+  }
+
+  let totalAdded = 0;
+  const subNames = [];
+  for (const i of validSubIndices) {
+    const sub = subs[i];
+    subNames.push(sub.site_name);
+    totalAdded += await this.dbManager.bindSubscriptionTargets(userId, sub.rss_url, chatIds);
+  }
+
+  const summary = `已绑定：订阅(${subNames.join(', ')}) -> 目标(${targetNames.join(', ')})\n新增绑定：${totalAdded} 个`;
+  await this.sendMessage(userId, summary);
+};
+
+TelegramBot.prototype.handleUnbindCommand = async function (userId, args) {
+  if (args.length < 1) {
+    await this.sendMessage(userId, '用法：/unbind <订阅号>');
+    return;
+  }
+  const subs = await this.dbManager.getUserSubscriptions(userId);
+  const subIndex = parseInt(args[0], 10) - 1;
+  if (isNaN(subIndex) || subIndex < 0 || subIndex >= subs.length) {
+    await this.sendMessage(userId, '无效订阅编号');
+    return;
+  }
+  const rssUrl = subs[subIndex].rss_url;
+  const removed = await this.dbManager.unbindSubscription(userId, rssUrl);
+  await this.sendMessage(userId, removed > 0 ? '已解除该订阅的所有绑定' : '该订阅没有任何绑定');
+};
