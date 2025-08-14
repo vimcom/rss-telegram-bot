@@ -32,6 +32,11 @@ export class DBManager {
         chat_id TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(rss_url, item_guid, chat_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS user_push_modes (
+        user_id TEXT PRIMARY KEY,
+        push_mode TEXT DEFAULT 'smart',
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )`
     ];
     for (const sql of stmts) {
@@ -294,6 +299,47 @@ export class DBManager {
     } catch (error) {
       console.error('获取统计信息失败:', error);
       return { subscriptions: 0, items: 0, users: 0 };
+    }
+  }
+
+  // ========== 用户推送模式管理 ==========
+  
+  // 获取用户推送模式
+  async getUserPushMode(userId) {
+    try {
+      const result = await this.db.prepare(
+        'SELECT push_mode FROM user_push_modes WHERE user_id = ?'
+      ).bind(userId).first();
+      return result?.push_mode || 'smart';
+    } catch (error) {
+      console.error('获取用户推送模式失败:', error);
+      return 'smart'; // 默认智能模式
+    }
+  }
+
+  // 设置用户推送模式
+  async setUserPushMode(userId, pushMode) {
+    try {
+      await this.db.prepare(
+        'INSERT OR REPLACE INTO user_push_modes (user_id, push_mode, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)'
+      ).bind(userId, pushMode).run();
+      return true;
+    } catch (error) {
+      console.error('设置用户推送模式失败:', error);
+      return false;
+    }
+  }
+
+  // 获取所有用户的推送模式统计
+  async getPushModeStats() {
+    try {
+      const result = await this.db.prepare(
+        'SELECT push_mode, COUNT(*) as count FROM user_push_modes GROUP BY push_mode'
+      ).all();
+      return result.results || [];
+    } catch (error) {
+      console.error('获取推送模式统计失败:', error);
+      return [];
     }
   }
 }
