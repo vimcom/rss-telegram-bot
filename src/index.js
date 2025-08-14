@@ -55,16 +55,31 @@ export default {
 
       // 分批处理 URLs，避免超时
       const urls = Array.from(urlToSubscribers.keys());
-      const BATCH_SIZE = 30;
+      const BATCH_SIZE = 20; // 减少批次大小，避免过载
+      
+      console.log(`开始处理 ${urls.length} 个RSS源，批次大小: ${BATCH_SIZE}`);
+      
       for (let i = 0; i < urls.length; i += BATCH_SIZE) {
         const batchUrls = urls.slice(i, i + BATCH_SIZE);
+        console.log(`处理批次 ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(urls.length/BATCH_SIZE)}`);
+        
         await Promise.all(batchUrls.map(async (rssUrl) => {
           const subsForUrl = urlToSubscribers.get(rssUrl);
           const siteName = subsForUrl[0]?.site_name || 'RSS';
+          
           try {
+            // 检查访问统计
+            const stats = rssParser.getAccessStats(rssUrl);
+            if (stats.rateLimitCount > 0) {
+              console.log(`跳过 ${siteName} (${rssUrl}) - 频率限制中 (${stats.rateLimitCount}次)`);
+              return;
+            }
+            
             const items = await rssParser.parseRSS(rssUrl);
             if (items.length > 0) {
               await dbManager.clearFailureRecord(rssUrl);
+              console.log(`成功解析 ${siteName}: ${items.length} 条内容`);
+              
               for (const item of items) {
                 const exists = await dbManager.checkItemExists(rssUrl, item.guid);
                 if (exists) continue;
@@ -79,18 +94,34 @@ export default {
                 // 每条item之间 200ms
                 await new Promise(resolve => setTimeout(resolve, 200));
               }
+            } else {
+              console.log(`跳过 ${siteName} - 无新内容或访问被限制`);
             }
           } catch (error) {
             console.error(`处理RSS源 ${rssUrl} 失败:`, error);
             await dbManager.recordFailure(rssUrl, error.message);
           }
         }));
-        // 批次间延迟
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        
+        // 批次间延迟，避免过载
+        if (i + BATCH_SIZE < urls.length) {
+          const delay = 2000; // 2秒延迟
+          console.log(`等待 ${delay}ms 后处理下一批次...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
       
       // 清理30天前的旧记录
       await dbManager.cleanupOldItems(30);
+      
+      // 输出访问统计信息
+      console.log('RSS检查完成，访问统计:');
+      for (const url of urls) {
+        const stats = rssParser.getAccessStats(url);
+        if (stats.failureCount > 0 || stats.rateLimitCount > 0) {
+          console.log(`${url}: 成功${stats.successCount}次, 失败${stats.failureCount}次, 限流${stats.rateLimitCount}次`);
+        }
+      }
       
     } catch (error) {
       console.error('RSS检查失败:', error);
