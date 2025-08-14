@@ -59,6 +59,14 @@ export class TelegramBot {
         await this.handleStatsCommand(userId);
         break;
       
+      case '/status':
+        await this.handleStatusCommand(userId);
+        break;
+      
+      case '/pushmode':
+        await this.handlePushModeCommand(userId, args);
+        break;
+      
       case '/channels':
         if (chatType !== 'private') {
           await this.sendMessage(message.chat.id.toString(), '请在与Bot的私聊中使用该命令');
@@ -106,6 +114,8 @@ export class TelegramBot {
           '🔧 /proxy <RSS链接> - 测试RSS源访问情况\n' +
           '⚠️ /failed - 查看失败的RSS订阅\n' +
           '📊 /stats - 查看统计信息\n' +
+          '📈 /status - 查看RSS源状态报告\n' +
+          '📱 /pushmode - 设置推送模式\n' +
           '❓ /help - 显示帮助信息'
         );
         break;
@@ -187,7 +197,7 @@ export class TelegramBot {
         const added = await this.dbManager.addSubscription(userId, url, siteName);
         
         if (added) {
-          results.push(`✅ 已添加：${siteName}${testResult.proxyUsed ? ' (通过代理)' : ''}`);
+          results.push(`✅ 已添加：${siteName}`);
           addedCount++;
         } else {
           results.push(`⚠️ 已订阅：${siteName}`);
@@ -216,8 +226,7 @@ export class TelegramBot {
       if (items.length > 0) {
         return { 
           accessible: true, 
-          siteName: await this.extractSiteName(url),
-          proxyUsed: false // 这里简化处理，实际可以从parser返回更多信息
+          siteName: await this.extractSiteName(url)
         };
       } else {
         return { 
@@ -258,7 +267,6 @@ export class TelegramBot {
     try {
       // 测试直接访问
       let directResult = '❌ 直接访问失败';
-      let proxyResult = '❌ 代理访问失败';
       let contentPreview = '';
 
       try {
@@ -284,18 +292,7 @@ export class TelegramBot {
         directResult = `❌ 直接访问失败 (${error.message})`;
       }
 
-      // 测试代理访问
-      if (!directResult.includes('成功')) {
-        try {
-          const items = await rssParser.parseRSS(url);
-          if (items.length > 0) {
-            proxyResult = '✅ 代理访问成功';
-            contentPreview = `📄 内容预览：${items[0].title}`;
-          }
-        } catch (error) {
-          proxyResult = `❌ 代理访问失败 (${error.message})`;
-        }
-      }
+      // 移除代理测试，只保留直接访问测试
 
       const siteName = await this.extractSiteName(url);
       
@@ -303,10 +300,9 @@ export class TelegramBot {
         `🔍 RSS源测试结果：\n\n` +
         `🌐 网站：${siteName}\n` +
         `🔗 链接：${url}\n\n` +
-        `📡 ${directResult}\n` +
-        `🔀 ${proxyResult}\n\n` +
+        `📡 ${directResult}\n\n` +
         `${contentPreview}\n\n` +
-        `💡 ${directResult.includes('成功') || proxyResult.includes('成功') ? 
+        `💡 ${directResult.includes('成功') ? 
           '该RSS源可以正常使用' : 
           '该RSS源暂时无法访问，建议检查链接或稍后再试'
         }`;
@@ -477,25 +473,110 @@ export class TelegramBot {
     await this.sendMessage(userId, message, true);
   }
 
-   // 发送RSS到私聊 + 绑定目标，带防重复和频率控制
+   // 智能推送RSS内容，支持多种推送模式
   async sendRSSUpdate(ownerUserId, rssUrl, item, siteName) {
-    // Always send to private chat (owner)
-    await this.sendRSSItem(ownerUserId, item, siteName);
-
-    // Send to bound targets (active only)
+    // 获取用户推送模式
+    const pushMode = await this.dbManager.getUserPushMode(ownerUserId) || 'smart';
+    
+    // 获取绑定的目标
     const chatIds = await this.dbManager.listBindingsForSubscription(ownerUserId, rssUrl);
-    for (const chatId of chatIds) {
-      try {
-        const already = await this.dbManager.hasPushedToChat(rssUrl, item.guid, chatId);
-        if (already) continue;
-        await this.sendRSSItem(chatId, item, siteName);
-        await this.dbManager.savePushRecord(rssUrl, item.guid, chatId);
-        // 100ms delay
-        await new Promise(r => setTimeout(r, 100));
-      } catch (e) {
-        console.warn('推送到目标失败', chatId, e.message);
-      }
+    
+    console.log(`用户 ${ownerUserId} 推送模式: ${pushMode}, 绑定目标: ${chatIds.length}个`);
+    
+    let sentToPrivate = false;
+    let sentToTargets = 0;
+    
+    // 根据推送模式决定推送策略
+    switch (pushMode) {
+      case 'smart':
+        // 智能模式：有绑定目标时只推送到目标，无绑定时推送到私聊
+        if (chatIds.length === 0) {
+          await this.sendRSSItem(ownerUserId, item, siteName);
+          sentToPrivate = true;
+          console.log(`智能模式：无绑定目标，推送到私聊`);
+        } else {
+          // 推送到绑定的目标
+          for (const chatId of chatIds) {
+            try {
+              const already = await this.dbManager.hasPushedToChat(rssUrl, item.guid, chatId);
+              if (already) {
+                console.log(`跳过已推送的内容到 ${chatId}`);
+                continue;
+              }
+              
+              await this.sendRSSItem(chatId, item, siteName);
+              await this.dbManager.savePushRecord(rssUrl, item.guid, chatId);
+              sentToTargets++;
+              
+              // 增加延迟，避免Telegram API速率限制
+              await new Promise(r => setTimeout(r, 200));
+            } catch (e) {
+              console.warn('推送到目标失败', chatId, e.message);
+            }
+          }
+          console.log(`智能模式：推送到 ${sentToTargets} 个绑定目标，跳过私聊`);
+        }
+        break;
+        
+      case 'both':
+        // 双重推送：同时推送到私聊和绑定的目标
+        await this.sendRSSItem(ownerUserId, item, siteName);
+        sentToPrivate = true;
+        
+        for (const chatId of chatIds) {
+          try {
+            const already = await this.dbManager.hasPushedToChat(rssUrl, item.guid, chatId);
+            if (already) {
+              console.log(`跳过已推送的内容到 ${chatId}`);
+              continue;
+            }
+            
+            await this.sendRSSItem(chatId, item, siteName);
+            await this.dbManager.savePushRecord(rssUrl, item.guid, chatId);
+            sentToTargets++;
+            
+            // 增加延迟，避免Telegram API速率限制
+            await new Promise(r => setTimeout(r, 200));
+          } catch (e) {
+            console.warn('推送到目标失败', chatId, e.message);
+          }
+        }
+        console.log(`双重推送：推送到私聊和 ${sentToTargets} 个绑定目标`);
+        break;
+        
+      case 'private':
+        // 仅私聊：只推送到私聊，不推送到绑定的目标
+        await this.sendRSSItem(ownerUserId, item, siteName);
+        sentToPrivate = true;
+        console.log(`仅私聊模式：推送到私聊，跳过 ${chatIds.length} 个绑定目标`);
+        break;
+        
+      case 'targets':
+        // 仅目标：只推送到绑定的目标，不推送到私聊
+        for (const chatId of chatIds) {
+          try {
+            const already = await this.dbManager.hasPushedToChat(rssUrl, item.guid, chatId);
+            if (already) {
+              console.log(`跳过已推送的内容到 ${chatId}`);
+              continue;
+            }
+            
+            await this.sendRSSItem(chatId, item, siteName);
+            await this.dbManager.savePushRecord(rssUrl, item.guid, chatId);
+            sentToTargets++;
+            
+            // 增加延迟，避免Telegram API速率限制
+            await new Promise(r => setTimeout(r, 200));
+          } catch (e) {
+            console.warn('推送到目标失败', chatId, e.message);
+          }
+        }
+        console.log(`仅目标模式：推送到 ${sentToTargets} 个绑定目标，跳过私聊`);
+        break;
     }
+    
+    // 记录推送统计
+    console.log(`推送完成：私聊${sentToPrivate ? '✅' : '❌'}, 目标${sentToTargets}个`);
   }
 
   async sendMessage(userId, text, parseMode = false) {
@@ -542,7 +623,22 @@ export class TelegramBot {
   }
 
   escapeMarkdown(text) {
-    return text.replace(/[_*\[\]()~`>#+=|{}.!-]/g, '\\$&');
+    if (!text) return '';
+    
+    // 使用更智能的转义策略，减少不必要的转义
+    // 只转义真正需要转义的字符，避免过度转义
+    return text
+      // 转义Markdown语法字符，但保留常见的标点符号
+      .replace(/([_*[\]()~`>#+=|{}])/g, '\\$1')
+      // 不转义句号、感叹号、连字符等常见标点，除非它们在特殊位置
+      .replace(/^\./g, '\\.') // 只在开头转义句号
+      .replace(/^!/g, '\\!')  // 只在开头转义感叹号
+      .replace(/^-/g, '\\-')  // 只在开头转义连字符
+      // 处理可能的Markdown链接格式，避免误转义
+      .replace(/([^\\])\[/g, '$1\\[')
+      .replace(/([^\\])\]/g, '$1\\]')
+      .replace(/([^\\])\(/g, '$1\\(')
+      .replace(/([^\\])\)/g, '$1\\)');
   }
 }
 
@@ -688,4 +784,139 @@ TelegramBot.prototype.handleUnbindCommand = async function (userId, args) {
   const rssUrl = subs[subIndex].rss_url;
   const removed = await this.dbManager.unbindSubscription(userId, rssUrl);
   await this.sendMessage(userId, removed > 0 ? '已解除该订阅的所有绑定' : '该订阅没有任何绑定');
+};
+
+// 添加状态查看命令
+TelegramBot.prototype.handleStatusCommand = async function (userId) {
+  try {
+    const userSubscriptions = await this.dbManager.getUserSubscriptions(userId);
+    if (userSubscriptions.length === 0) {
+      await this.sendMessage(userId, '您还没有任何订阅，使用 /add 添加RSS源');
+      return;
+    }
+
+    // 动态导入RSSParser以获取访问统计
+    const { RSSParser } = await import('./rss-parser.js');
+    const rssParser = new RSSParser();
+    
+    let message = `📊 RSS源状态报告 (${userSubscriptions.length}个)：\n\n`;
+    
+    for (let i = 0; i < userSubscriptions.length; i++) {
+      const sub = userSubscriptions[i];
+      const stats = rssParser.getAccessStats(sub.rss_url);
+      
+      let status = '🟢 正常';
+      let details = '';
+      
+      if (stats.rateLimitCount > 0) {
+        status = '🔴 频率限制';
+        const lastAccess = new Date(stats.lastAccess);
+        const now = new Date();
+        const timeDiff = Math.floor((now - lastAccess) / 1000 / 60); // 分钟
+        details = `限流${stats.rateLimitCount}次，${timeDiff}分钟前访问`;
+      } else if (stats.failureCount > 0) {
+        status = '🟡 部分失败';
+        details = `失败${stats.failureCount}次，成功${stats.successCount}次`;
+      } else if (stats.successCount > 0) {
+        details = `成功${stats.successCount}次`;
+      }
+      
+      message += `${i + 1}. ${sub.site_name}\n`;
+      message += `   ${status}\n`;
+      if (details) {
+        message += `   📝 ${details}\n`;
+      }
+      message += `   🔗 ${sub.rss_url}\n\n`;
+    }
+    
+    message += '💡 使用 /status 查看最新状态\n';
+    message += '💡 频率限制的源会自动跳过，无需手动处理';
+    
+    await this.sendMessage(userId, message);
+  } catch (error) {
+    console.error('获取状态信息失败:', error);
+    await this.sendMessage(userId, '获取状态信息失败，请稍后再试');
+  }
+};
+
+// 添加推送模式设置命令
+TelegramBot.prototype.handlePushModeCommand = async function (userId, args) {
+  try {
+    if (args.length === 0) {
+      // 显示当前推送模式
+      const currentMode = await this.dbManager.getUserPushMode(userId) || 'smart';
+      let modeDescription = '';
+      
+      switch (currentMode) {
+        case 'smart':
+          modeDescription = '智能模式：有绑定目标时只推送到目标，无绑定时推送到私聊';
+          break;
+        case 'both':
+          modeDescription = '双重推送：同时推送到私聊和绑定的目标';
+          break;
+        case 'private':
+          modeDescription = '仅私聊：只推送到私聊，不推送到绑定的目标';
+          break;
+        case 'targets':
+          modeDescription = '仅目标：只推送到绑定的目标，不推送到私聊';
+          break;
+        default:
+          modeDescription = '智能模式：有绑定目标时只推送到目标，无绑定时推送到私聊';
+      }
+      
+      const message = 
+        `📱 当前推送模式：${currentMode.toUpperCase()}\n\n` +
+        `📝 ${modeDescription}\n\n` +
+        `🔄 可用模式：\n` +
+        `• smart - 智能模式（推荐）\n` +
+        `• both - 双重推送\n` +
+        `• private - 仅私聊\n` +
+        `• targets - 仅目标\n\n` +
+        `💡 用法：/pushmode <模式>\n` +
+        `💡 示例：/pushmode smart`;
+      
+      await this.sendMessage(userId, message);
+      return;
+    }
+    
+    const mode = args[0].toLowerCase();
+    const validModes = ['smart', 'both', 'private', 'targets'];
+    
+    if (!validModes.includes(mode)) {
+      await this.sendMessage(userId, 
+        `❌ 无效的推送模式：${mode}\n\n` +
+        `✅ 可用模式：${validModes.join(', ')}`
+      );
+      return;
+    }
+    
+    // 保存用户推送模式
+    await this.dbManager.setUserPushMode(userId, mode);
+    
+    let modeDescription = '';
+    switch (mode) {
+      case 'smart':
+        modeDescription = '智能模式：有绑定目标时只推送到目标，无绑定时推送到私聊';
+        break;
+      case 'both':
+        modeDescription = '双重推送：同时推送到私聊和绑定的目标';
+        break;
+      case 'private':
+        modeDescription = '仅私聊：只推送到私聊，不推送到绑定的目标';
+        break;
+      case 'targets':
+        modeDescription = '仅目标：只推送到绑定的目标，不推送到私聊';
+        break;
+    }
+    
+    await this.sendMessage(userId, 
+      `✅ 推送模式已更新为：${mode.toUpperCase()}\n\n` +
+      `📝 ${modeDescription}\n\n` +
+      `💡 新设置将在下次RSS更新时生效`
+    );
+    
+  } catch (error) {
+    console.error('设置推送模式失败:', error);
+    await this.sendMessage(userId, '设置推送模式失败，请稍后再试');
+  }
 };
