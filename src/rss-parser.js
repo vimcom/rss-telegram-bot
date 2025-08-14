@@ -1,18 +1,21 @@
 export class RSSParser {
   constructor() {
-    // 公共RSS代理服务列表
-    this.proxyServices = [
-      'https://api.rss2json.com/v1/api.json?rss_url=',
-      'https://cors-anywhere.herokuapp.com/',
-      'https://api.allorigins.win/raw?url=',
-    ];
+    // 移除无用的公共RSS代理服务列表
+    // 添加访问频率控制
+    this.rateLimitMap = new Map(); // 记录每个URL的访问时间和失败次数
   }
 
   async parseRSS(url) {
+    // 检查访问频率限制
+    if (this.isRateLimited(url)) {
+      console.log(`跳过 ${url} - 访问频率限制中`);
+      return [];
+    }
+
     const maxRetries = 3;
     let lastError;
     
-    // 首先尝试直接访问
+    // 只尝试直接访问，移除代理方案
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const response = await this.fetchWithHeaders(url, attempt);
@@ -22,11 +25,18 @@ export class RSSParser {
           const items = this.parseXML(xmlText);
           
           if (items.length > 0) {
+            // 成功访问，重置失败计数
+            this.recordSuccess(url);
             return items;
           }
+        } else if (response.status === 429) {
+          // 429错误特殊处理
+          console.warn(`访问频率限制 ${url}, 设置更长的冷却时间`);
+          this.recordRateLimit(url);
+          break; // 429错误直接退出，不重试
         } else if (response.status === 403) {
-          console.warn(`直接访问被拒绝 ${url}, 尝试代理方案`);
-          break; // 403错误直接跳到代理方案
+          console.warn(`直接访问被拒绝 ${url}, 尝试次数: ${attempt}`);
+          // 403错误继续重试，但使用不同的User-Agent
         } else {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -34,87 +44,93 @@ export class RSSParser {
         lastError = error;
         console.warn(`RSS解析尝试 ${attempt}/${maxRetries} 失败 ${url}:`, error.message);
         
-        if (attempt < maxRetries && !error.message.includes('403')) {
+        if (attempt < maxRetries) {
           await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
         }
       }
     }
     
-    // 如果直接访问失败，尝试代理服务
-    console.log(`尝试通过代理访问 ${url}`);
-    const proxyResult = await this.tryProxyServices(url);
-    if (proxyResult && proxyResult.length > 0) {
-      return proxyResult;
-    }
-    
-    console.error(`所有方法都失败了 ${url}: ${lastError?.message || 'Unknown error'}`);
+    // 记录失败
+    this.recordFailure(url);
+    console.error(`所有尝试都失败了 ${url}: ${lastError?.message || 'Unknown error'}`);
     return [];
   }
 
-  async tryProxyServices(url) {
-    for (const proxy of this.proxyServices) {
-      try {
-        console.log(`尝试代理: ${proxy}`);
-        
-        let proxyUrl;
-        let response;
-        
-        if (proxy.includes('rss2json.com')) {
-          // RSS2JSON API - 返回JSON格式
-          proxyUrl = proxy + encodeURIComponent(url);
-          response = await fetch(proxyUrl, {
-            headers: {
-              'User-Agent': 'RSS-Bot/1.0',
-              'Accept': 'application/json'
-            },
-            timeout: 20000
-          });
-          
-          if (response.ok) {
-            const jsonData = await response.json();
-            if (jsonData.status === 'ok' && jsonData.items) {
-              return this.convertJsonToItems(jsonData.items);
-            }
-          }
-        } else {
-          // 其他CORS代理
-          proxyUrl = proxy + encodeURIComponent(url);
-          response = await fetch(proxyUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/xml, text/xml, */*',
-              'X-Requested-With': 'XMLHttpRequest'
-            },
-            timeout: 20000
-          });
-          
-          if (response.ok) {
-            const xmlText = await response.text();
-            const items = this.parseXML(xmlText);
-            if (items.length > 0) {
-              return items;
-            }
-          }
-        }
-      } catch (error) {
-        console.warn(`代理 ${proxy} 失败:`, error.message);
-        continue;
-      }
+  // 检查是否被频率限制
+  isRateLimited(url) {
+    const record = this.rateLimitMap.get(url);
+    if (!record) return false;
+    
+    const now = Date.now();
+    const timeSinceLastAccess = now - record.lastAccess;
+    
+    // 根据失败次数和错误类型设置不同的冷却时间
+    let cooldownTime = 60000; // 默认1分钟
+    
+    if (record.rateLimitCount > 0) {
+      // 429错误：指数退避策略
+      cooldownTime = Math.min(300000 * Math.pow(2, record.rateLimitCount), 3600000); // 5分钟到1小时
+    } else if (record.failureCount > 0) {
+      // 其他错误：线性退避策略
+      cooldownTime = Math.min(120000 * record.failureCount, 1800000); // 2分钟到30分钟
     }
     
-    return null;
+    return timeSinceLastAccess < cooldownTime;
   }
 
-  // 将RSS2JSON的结果转换为标准格式
-  convertJsonToItems(jsonItems) {
-    return jsonItems.slice(0, 10).map(item => ({
-      title: item.title || '',
-      link: item.link || '',
-      description: this.stripHTML(item.description || '').substring(0, 200),
-      guid: item.guid || item.link || item.title,
-      publishedAt: item.pubDate ? new Date(item.pubDate).toLocaleString('zh-CN') : ''
-    }));
+  // 记录成功访问
+  recordSuccess(url) {
+    this.rateLimitMap.set(url, {
+      lastAccess: Date.now(),
+      failureCount: 0,
+      rateLimitCount: 0,
+      successCount: (this.rateLimitMap.get(url)?.successCount || 0) + 1
+    });
   }
+
+  // 记录失败访问
+  recordFailure(url) {
+    const record = this.rateLimitMap.get(url) || {
+      lastAccess: 0,
+      failureCount: 0,
+      rateLimitCount: 0,
+      successCount: 0
+    };
+    
+    record.lastAccess = Date.now();
+    record.failureCount++;
+    
+    this.rateLimitMap.set(url, record);
+  }
+
+  // 记录频率限制
+  recordRateLimit(url) {
+    const record = this.rateLimitMap.get(url) || {
+      lastAccess: 0,
+      failureCount: 0,
+      rateLimitCount: 0,
+      successCount: 0
+    };
+    
+    record.lastAccess = Date.now();
+    record.rateLimitCount++;
+    
+    this.rateLimitMap.set(url, record);
+  }
+
+  // 获取访问统计信息
+  getAccessStats(url) {
+    return this.rateLimitMap.get(url) || {
+      lastAccess: 0,
+      failureCount: 0,
+      rateLimitCount: 0,
+      successCount: 0
+    };
+  }
+
+  // 移除 tryProxyServices 方法
+
+  // 移除 convertJsonToItems 方法
 
   async fetchWithHeaders(url, attempt = 1) {
     // 根据尝试次数使用不同的请求策略
