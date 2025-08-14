@@ -62,3 +62,11 @@ CREATE TABLE IF NOT EXISTS push_records (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(rss_url, item_guid, chat_id)
 );
+
+-- 用户推送模式表：存储用户的推送偏好设置
+CREATE TABLE IF NOT EXISTS user_push_modes (
+    user_id TEXT PRIMARY KEY,
+    push_mode TEXT DEFAULT 'smart' CHECK (push_mode IN ('smart', 'both', 'private', 'targets')),
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
